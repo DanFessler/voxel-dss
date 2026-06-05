@@ -2,7 +2,7 @@
 
 ![The same voxel well asset shaded three ways. Left: traditional cube-face lighting with harsh stair-stepping. Center: per-voxel Derived Surface Shading, reading as rounded form. Right: vertex-interpolated Derived Surface Shading, smoother still - all three share identical blocky geometry.](figures/figure-hero.png)
 
-*One voxel asset, three shading approaches over identical geometry: traditional cube faces (left), per-voxel Derived Surface Shading (center), and vertex-interpolated DSS (right). The occupancy-centroid normal field (radius 1) lets lighting describe the implied form while the blocky silhouette is preserved.*
+*One voxel asset, three shading approaches over identical geometry: traditional cube faces (left), per-voxel Derived Surface Shading (center), and vertex-interpolated DSS (right). The occupancy-centroid normal field (radius 1) lets lighting describe the implied form while the blocky silhouette is preserved. Model by [Zach Soares (@Voxels)](https://x.com/Voxels).*
 
 ## Abstract
 
@@ -300,7 +300,7 @@ $$
 
 The resulting vector is normalized:
 
-$$N = \operatorname{normalize}(N_x, N_y, N_z)$$
+$$N = \mathrm{normalize}(N_x, N_y, N_z)$$
 
 Smoothing followed by a finite-difference gradient is itself a single linear operation: convolving occupancy with a **derivative-of-Gaussian** kernel. The density-gradient field is therefore a standard **convolution filter** - the same family of operators used for gradient and edge detection in image and volume processing. (The prototype zeroes the kernel's weight along the axis being differenced, making the filter slightly anisotropic, but the operation remains a kernel convolution.)
 
@@ -357,7 +357,7 @@ where $q$ ranges over the neighborhood kernel.
 
 The normal points away from the centroid:
 
-$$N = \operatorname{normalize}(p - C)$$
+$$N = \mathrm{normalize}(p - C)$$
 
 Both the numerator $\sum_{q} V(q)\,w(q)\,q$ and the denominator $\sum_{q} V(q)\,w(q)$ are convolutions of the occupancy field with kernels (the first weighted by position, the second by $w$ alone). Because the result is their ratio - dividing by the locally varying occupied mass - the centroid field is a **normalized convolution** rather than a single linear filter: convolution-based, but nonlinear due to the per-voxel normalization.
 
@@ -377,7 +377,7 @@ Large kernels increasingly emphasize overall form rather than local topology.
 
 ![A grid cross-section with a rounded mass in the lower-left. Within the kernel around the sample voxel p, the occupied cells are highlighted and their weighted centroid C is marked; the normal points from C through p, away from the mass.](figures/figure-6.svg)
 
-Within the kernel around $p$, the Gaussian-weighted centroid $C$ of the occupied voxels is computed. The normal $N = \operatorname{normalize}(p - C)$ points away from the nearby occupied mass - a mass-distribution interpretation of surface orientation.
+Within the kernel around $p$, the Gaussian-weighted centroid $C$ of the occupied voxels is computed. The normal $N = \mathrm{normalize}(p - C)$ points away from the nearby occupied mass - a mass-distribution interpretation of surface orientation.
 
 ---
 
@@ -617,7 +617,7 @@ In practice the severity depends heavily on the asset. On organic, detailed mode
 
 ![Two real-world voxel assets - a stone well with a timber roof - each shown twice: a traditional cube-face control on the left and per-voxel DSS on the right. The DSS versions read as rounded, sculpted form; the second asset's single-voxel green foliage shades as natural-looking noise.](figures/figure-13.png)
 
-Two real-world `.vox` assets, each shown with a traditional cube-face control (left) and per-voxel DSS (right), using each file's own palette. Against the control, the DSS versions give the solid stone and timber a rounded, form-revealing read instead of flat per-face lighting. The second asset adds single-voxel foliage, which exhibits exactly the ill-defined-normal behavior described above - yet because it is scattered greenery, the resulting variation reads as natural leafy noise rather than a defect.
+Two real-world `.vox` assets, each shown with a traditional cube-face control (left) and per-voxel DSS (right), using each file's own palette. Against the control, the DSS versions give the solid stone and timber a rounded, form-revealing read instead of flat per-face lighting. The second asset adds single-voxel foliage, which exhibits exactly the ill-defined-normal behavior described above - yet because it is scattered greenery, the resulting variation reads as natural leafy noise rather than a defect. Models by [Zach Soares (@Voxels)](https://x.com/Voxels).
 
 A natural mitigation (Section 15) is to detect thin or isolated voxels and fall back to cube-face normals there, so DSS is applied only where the occupancy field actually implies a surface.
 
@@ -694,3 +694,9 @@ Within this framework, surface orientation becomes a derived property of occupan
 This allows voxel renderers to preserve silhouettes, topology, and geometric identity while communicating larger-scale shape information through lighting.
 
 The resulting design space remains largely unexplored and offers numerous opportunities for future research in voxel rendering, stylized graphics, and occupancy-based surface representation.
+
+---
+
+# Acknowledgments
+
+The example voxel models used in several figures (the well assets) were contributed by [Zach Soares (@Voxels)](https://x.com/Voxels). The per-face smooth-normal direction discussed in Section 15 was suggested by [@LongTimeNoDuck](https://x.com/LongTimeNoDuck/status/2062932216334762202).
