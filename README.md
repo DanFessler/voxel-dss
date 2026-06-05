@@ -127,3 +127,9 @@ node figures/record-gif.mjs     # then open http://localhost:7788/ once
 This is a research prototype. The whitepaper outlines several open directions - larger kernels,
 alternative weighting functions, GPU normal generation, and DSS combined with palette-quantized
 lighting - that remain to be explored.
+
+## Credits
+
+The example voxel models in [`src/examples/`](src/examples/) - used for several whitepaper figures
+and bundled with the editor - were contributed by [Zach Soares (@Voxels)](https://x.com/Voxels).
+Thanks!
