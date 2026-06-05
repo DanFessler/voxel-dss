@@ -1,0 +1,218 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>DSS dynamic-light recorder</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #111;
+        color: #eee;
+        font-family: system-ui, sans-serif;
+      }
+      #status {
+        position: fixed;
+        top: 8px;
+        left: 8px;
+        font-size: 14px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="status">starting…</div>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.179.1/build/three.module.js"
+        }
+      }
+    </script>
+
+    <script type="module">
+      import * as THREE from "three";
+
+      // ---- Recording parameters -------------------------------------------
+      const W = 760;
+      const H = 400;
+      const FRAMES = 64;
+      const DELAY = 40; // ms per frame (~25 fps)
+
+      // ---- Voxel field (same math as whitepaper_demo.html) -----------------
+      const voxelSize = 1.0;
+      const kernelRadius = 2;
+      const SPHERE_R = 4.6;
+
+      function solid(ix, iy, iz) {
+        const x = ix * voxelSize,
+          y = iy * voxelSize,
+          z = iz * voxelSize;
+        return Math.sqrt(x * x + y * y + z * z) <= SPHERE_R;
+      }
+
+      function gw(dx, dy, dz, r) {
+        const s = Math.max(0.75, r * 0.65);
+        return Math.exp(-(dx * dx + dy * dy + dz * dz) / (2 * s * s));
+      }
+
+      function density(x, y, z, ignore) {
+        let sum = 0,
+          tot = 0;
+        for (let dx = -kernelRadius; dx <= kernelRadius; dx++)
+          for (let dy = -kernelRadius; dy <= kernelRadius; dy++)
+            for (let dz = -kernelRadius; dz <= kernelRadius; dz++) {
+              const wx = ignore === 0 ? 0 : dx;
+              const wy = ignore === 1 ? 0 : dy;
+              const wz = ignore === 2 ? 0 : dz;
+              const w = gw(wx, wy, wz, kernelRadius);
+              sum += (solid(x + dx, y + dy, z + dz) ? 1 : 0) * w;
+              tot += w;
+            }
+        return tot > 0 ? sum / tot : 0;
+      }
+
+      function baseNormal(x, y, z) {
+        const r = kernelRadius;
+        const n = new THREE.Vector3(
+          density(x - r, y, z, 0) - density(x + r, y, z, 0),
+          density(x, y - r, z, 1) - density(x, y + r, z, 1),
+          density(x, y, z - r, 2) - density(x, y, z + r, 2),
+        );
+        if (n.lengthSq() < 1e-4) n.set(x, y, z);
+        return n.normalize();
+      }
+
+      function faceDefs(s) {
+        const h = s / 2;
+        return [
+          { n: [1, 0, 0], d: [1, 0, 0], c: [[h, -h, -h], [h, h, -h], [h, h, h], [h, -h, h]] },
+          { n: [-1, 0, 0], d: [-1, 0, 0], c: [[-h, -h, h], [-h, h, h], [-h, h, -h], [-h, -h, -h]] },
+          { n: [0, 1, 0], d: [0, 1, 0], c: [[-h, h, -h], [-h, h, h], [h, h, h], [h, h, -h]] },
+          { n: [0, -1, 0], d: [0, -1, 0], c: [[-h, -h, h], [-h, -h, -h], [h, -h, -h], [h, -h, h]] },
+          { n: [0, 0, 1], d: [0, 0, 1], c: [[h, -h, h], [h, h, h], [-h, h, h], [-h, -h, h]] },
+          { n: [0, 0, -1], d: [0, 0, -1], c: [[-h, -h, -h], [-h, h, -h], [h, h, -h], [h, -h, -h]] },
+        ];
+      }
+
+      function computeVoxels() {
+        const lim = Math.ceil(6 / voxelSize);
+        const fd = faceDefs(voxelSize);
+        const out = [];
+        for (let x = -lim; x <= lim; x++)
+          for (let y = -lim; y <= lim; y++)
+            for (let z = -lim; z <= lim; z++) {
+              if (!solid(x, y, z)) continue;
+              let visible = false;
+              for (const f of fd)
+                if (!solid(x + f.d[0], y + f.d[1], z + f.d[2])) visible = true;
+              if (!visible) continue;
+              out.push({ x, y, z, wx: x * voxelSize, wy: y * voxelSize, wz: z * voxelSize, n: baseNormal(x, y, z) });
+            }
+        return out;
+      }
+
+      function buildGeometry(voxels, mode, xOffset) {
+        const fd = faceDefs(voxelSize);
+        const pos = [],
+          nor = [],
+          idx = [];
+        let vi = 0;
+        for (const v of voxels) {
+          for (const f of fd) {
+            if (solid(v.x + f.d[0], v.y + f.d[1], v.z + f.d[2])) continue;
+            const normal = mode === "cube" ? f.n : [v.n.x, v.n.y, v.n.z];
+            for (const c of f.c) {
+              pos.push(v.wx + c[0] + xOffset, v.wy + c[1], v.wz + c[2]);
+              nor.push(normal[0], normal[1], normal[2]);
+            }
+            idx.push(vi, vi + 1, vi + 2, vi, vi + 2, vi + 3);
+            vi += 4;
+          }
+        }
+        const g = new THREE.BufferGeometry();
+        g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+        g.setAttribute("normal", new THREE.Float32BufferAttribute(nor, 3));
+        g.setIndex(idx);
+        return g;
+      }
+
+      // ---- Scene -----------------------------------------------------------
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x111317);
+
+      const camera = new THREE.PerspectiveCamera(45, W / H, 0.1, 200);
+      camera.position.set(0, 7, 22);
+      camera.lookAt(0, 0, 0);
+
+      const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+      renderer.setPixelRatio(1);
+      renderer.setSize(W, H);
+      document.body.appendChild(renderer.domElement);
+
+      scene.add(new THREE.AmbientLight(0xffffff, 0.09));
+      const dir = new THREE.DirectionalLight(0xffffff, 2.4);
+      scene.add(dir);
+      const lightViz = new THREE.Mesh(
+        new THREE.SphereGeometry(0.22, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0xffe9a0 }),
+      );
+      scene.add(lightViz);
+
+      const voxels = computeVoxels();
+      const offset = 6.45;
+      const mat = new THREE.MeshStandardMaterial({ color: 0x9fb2d8, roughness: 0.92, metalness: 0.0 });
+      scene.add(new THREE.Mesh(buildGeometry(voxels, "cube", -offset), mat));
+      scene.add(new THREE.Mesh(buildGeometry(voxels, "perVoxel", offset), mat.clone()));
+
+      // ---- Capture canvas (adds labels + split line into each frame) -------
+      const cap = document.createElement("canvas");
+      cap.width = W;
+      cap.height = H;
+      const ctx = cap.getContext("2d", { willReadFrequently: true });
+
+      function drawOverlay() {
+        ctx.font = "600 16px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillStyle = "rgba(0,0,0,0.55)";
+        ctx.fillRect(0, H - 30, W, 30);
+        ctx.fillStyle = "#eef2f8";
+        ctx.fillText("Cube-face normals", W * 0.25, H - 10);
+        ctx.fillText("Derived surface shading", W * 0.75, H - 10);
+        ctx.strokeStyle = "rgba(255,255,255,0.25)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(W / 2, 0);
+        ctx.lineTo(W / 2, H - 30);
+        ctx.stroke();
+      }
+
+      const status = document.getElementById("status");
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      async function record() {
+        for (let i = 0; i < FRAMES; i++) {
+          const a = (i / FRAMES) * Math.PI * 2;
+          const ld = new THREE.Vector3(Math.cos(a), 0.62, Math.sin(a)).normalize();
+          dir.position.copy(ld.clone().multiplyScalar(14));
+          lightViz.position.copy(ld.clone().multiplyScalar(8.5));
+
+          renderer.render(scene, camera);
+          ctx.drawImage(renderer.domElement, 0, 0, W, H);
+          drawOverlay();
+          const data = ctx.getImageData(0, 0, W, H).data;
+
+          await fetch(`/frame?i=${i}`, { method: "POST", body: data });
+          status.textContent = `recorded frame ${i + 1}/${FRAMES}`;
+          await sleep(0);
+        }
+        await fetch(`/done?w=${W}&h=${H}&n=${FRAMES}&delay=${DELAY}`, { method: "POST" });
+        status.textContent = "DONE";
+        document.title = "DONE";
+      }
+
+      // Give three.js a tick to compile shaders before the first read.
+      requestAnimationFrame(() => requestAnimationFrame(record));
+    </script>
+  </body>
+</html>
