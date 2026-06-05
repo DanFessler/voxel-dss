@@ -12,6 +12,7 @@ import { useEditorStore } from "./state/editorStore";
 
 export function App() {
   const engineRef = useRef<VoxelEngine | null>(null);
+  const editorMode = useEditorStore((s) => s.editorMode);
 
   // Global keyboard shortcuts (MagicaVoxel-inspired).
   useEffect(() => {
@@ -71,7 +72,7 @@ export function App() {
         <Toolbar />
         <Viewport engineRef={engineRef} />
         <aside className="panels">
-          <StarterShapesPanel />
+          {editorMode === "sculpt" && <StarterShapesPanel />}
           <PalettePanel />
           <ShadingPanel />
         </aside>

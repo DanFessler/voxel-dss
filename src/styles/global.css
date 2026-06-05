@@ -304,6 +304,66 @@ kbd {
   color: #c8d4f0;
 }
 
+.toolbar__note {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+  margin: 0;
+}
+
+/* --------------------------------------------------------- tri-view modeling */
+
+.triview-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.seg {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.seg__btn {
+  background: var(--panel-2);
+  color: var(--text);
+  border: none;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+.seg__btn.is-active {
+  background: var(--accent-dim);
+  color: #fff;
+}
+
+.triview-plane {
+  margin-bottom: 12px;
+}
+.triview-plane__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+.triview-plane__label {
+  font-size: 12px;
+  font-weight: 600;
+}
+.triview-plane__hint {
+  font-size: 10px;
+  color: var(--muted);
+}
+.triview-canvas {
+  display: block;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  image-rendering: pixelated;
+  cursor: crosshair;
+  touch-action: none;
+}
+
 .palette-current {
   display: flex;
   align-items: center;

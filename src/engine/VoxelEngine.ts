@@ -14,16 +14,27 @@ import {
   MeshBasicMaterial,
   MeshStandardMaterial,
   MOUSE,
+  OrthographicCamera,
   PerspectiveCamera,
   PlaneGeometry,
   Raycaster,
   Scene,
+  Spherical,
   Vector2,
   Vector3,
   WebGLRenderer,
 } from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { VoxelData } from "@/voxel/VoxelData";
+import { ViewGizmo, type GizmoFace } from "./ViewGizmo";
+import { VoxelData, type VoxelDims } from "@/voxel/VoxelData";
+import type { Palette } from "@/voxel/palette";
+import { TriViewMasks, type MaskSnapshot } from "@/voxel/TriViewMasks";
+import {
+  TriViewPlanes,
+  type PlaneHit,
+  type PlaneId,
+  type PreviewSpec,
+} from "./TriViewPlanes";
 import { buildVoxelMesh } from "@/voxel/meshBuilder";
 import type { DssSettings } from "@/voxel/dss";
 import type { AoSettings } from "@/voxel/ao";
@@ -35,6 +46,34 @@ import {
 } from "@/voxel/starterShapes";
 
 const MAX_HISTORY = 64;
+
+/** One undo/redo step: the volume plus the tri-view masks at that point. */
+interface HistoryEntry {
+  volume: VoxelData;
+  masks: MaskSnapshot;
+}
+
+// Camera view modes. The transition is run on the perspective camera by
+// narrowing the FOV (and dollying out to hold perceived size), then we swap to
+// a true orthographic camera at the end so parallel lines are actually parallel.
+const FOV_PERSP = 45;
+const FOV_ORTHO = 6; // near-parallel; the seam into the real ortho camera.
+const CAM_ANIM_DURATION = 0.26; // seconds - snappy.
+
+/** In-flight camera transition between view modes / orientations. */
+interface CamAnim {
+  elapsed: number;
+  startTheta: number;
+  startPhi: number;
+  startFov: number;
+  dTheta: number;
+  goalPhi: number;
+  goalFov: number;
+  /** radius * tan(fov/2) - constant for the whole transition (perceived size). */
+  k: number;
+  target: Vector3;
+  onDone?: () => void;
+}
 
 // Line strokes span at most one volume dimension (<= 256 cells); this cap leaves
 // generous headroom for the instanced preview buffer.
@@ -61,7 +100,9 @@ interface Cell {
 export class VoxelEngine {
   private container: HTMLElement;
   private scene = new Scene();
-  private camera: PerspectiveCamera;
+  private perspCamera: PerspectiveCamera;
+  private orthoCamera: OrthographicCamera;
+  private camera: PerspectiveCamera | OrthographicCamera;
   private renderer: WebGLRenderer;
   private controls: OrbitControls;
 
@@ -82,6 +123,19 @@ export class VoxelEngine {
   private previewCells!: InstancedMesh;
   private previewMatrix = new Matrix4();
 
+  // Tri-view modeling: silhouette masks + the in-volume planes you draw on.
+  private triMasks: TriViewMasks;
+  private triPlanes: TriViewPlanes;
+  private triPainting = false;
+  private triValue = 1;
+  private triDragStart: PlaneHit | null = null;
+
+  // Orientation gizmo + camera view-mode state.
+  private gizmo = new ViewGizmo();
+  private camAnim: CamAnim | null = null;
+  private projection: "persp" | "ortho" = "persp";
+  private lastT = performance.now();
+
   private dirLight: DirectionalLight;
   private raycaster = new Raycaster();
   private pointer = new Vector2();
@@ -100,9 +154,10 @@ export class VoxelEngine {
   // While Space is held, left-drag pans instead of drawing (MagicaVoxel).
   private spacePan = false;
 
-  // Undo/redo snapshots.
-  private undoStack: VoxelData[] = [];
-  private redoStack: VoxelData[] = [];
+  // Undo/redo snapshots. Each entry captures both the volume and the tri-view
+  // masks so undo is correct in either editing mode.
+  private undoStack: HistoryEntry[] = [];
+  private redoStack: HistoryEntry[] = [];
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -112,7 +167,9 @@ export class VoxelEngine {
 
     this.scene.background = new Color(0x1a1c22);
 
-    this.camera = new PerspectiveCamera(45, w / h, 0.1, 2000);
+    this.perspCamera = new PerspectiveCamera(FOV_PERSP, w / h, 0.1, 4000);
+    this.orthoCamera = new OrthographicCamera(-1, 1, 1, -1, 0.1, 4000);
+    this.camera = this.perspCamera;
     const c = this.center();
     this.camera.position.set(c.x + 40, c.y + 38, c.z + 52);
 
@@ -201,6 +258,11 @@ export class VoxelEngine {
       roughness: 0.85,
       metalness: 0.0,
     });
+
+    // Tri-view planes (hidden until the user switches to tri-view mode).
+    this.triMasks = new TriViewMasks(this.data.dims);
+    this.triPlanes = new TriViewPlanes(this.data.dims, this.triMasks);
+    this.scene.add(this.triPlanes.group);
 
     this.seedDemoModel();
     this.rebuildMesh();
@@ -294,6 +356,10 @@ export class VoxelEngine {
     if (this.disposed) return;
     this.frame = requestAnimationFrame(this.renderLoop);
 
+    const now = performance.now();
+    const dt = Math.min(0.05, (now - this.lastT) / 1000);
+    this.lastT = now;
+
     this.flushRebuild();
 
     if (useEditorStore.getState().lightAutoRotate) {
@@ -307,16 +373,232 @@ export class VoxelEngine {
       );
     }
 
+    // OrbitControls always runs (orbit is never blocked); an active transition
+    // then overrides the camera on top of it.
     this.controls.update();
+    if (this.camAnim) this.updateCamAnim(dt);
+
     this.renderer.render(this.scene, this.camera);
+    this.gizmo.update(this.camera, this.controls.target);
+    this.gizmo.render(this.renderer);
   };
 
   private resize(): void {
     const { clientWidth: w, clientHeight: h } = this.container;
     if (w === 0 || h === 0) return;
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+    const aspect = w / h;
+    this.perspCamera.aspect = aspect;
+    this.perspCamera.updateProjectionMatrix();
+    const top = this.orthoCamera.top;
+    this.orthoCamera.left = -top * aspect;
+    this.orthoCamera.right = top * aspect;
+    this.orthoCamera.updateProjectionMatrix();
     this.renderer.setSize(w, h);
+  }
+
+  // --------------------------------------------------------- camera view modes
+
+  private fovHalfTan(fovDeg: number): number {
+    return Math.tan(((fovDeg * Math.PI) / 180) / 2);
+  }
+
+  private aspect(): number {
+    const { clientWidth: w, clientHeight: h } = this.container;
+    return h > 0 ? w / h : 1;
+  }
+
+  /** Make `cam` the active camera, rebinding OrbitControls to it. */
+  private setActiveCamera(cam: PerspectiveCamera | OrthographicCamera): void {
+    if (this.camera === cam) return;
+    cam.position.copy(this.camera.position);
+    cam.up.copy(this.camera.up);
+    cam.quaternion.copy(this.camera.quaternion);
+    this.camera = cam;
+    this.controls.object = cam;
+    this.controls.update();
+  }
+
+  /** Half-height of the view at the target plane (the perceived-size metric). */
+  private currentK(): number {
+    const r = this.camera.position.distanceTo(this.controls.target);
+    if (this.camera === this.perspCamera) {
+      return r * this.fovHalfTan(this.perspCamera.fov);
+    }
+    return this.orthoCamera.top / this.orthoCamera.zoom;
+  }
+
+  /**
+   * Ensure the perspective camera is active and configured to match the current
+   * view, so a FOV transition can start seamlessly from an orthographic lock.
+   */
+  private prepPerspForAnim(): void {
+    if (this.camera === this.perspCamera) return;
+    const k = this.currentK();
+    const target = this.controls.target;
+    const dir = this.camera.position.clone().sub(target).normalize();
+    const r = k / this.fovHalfTan(FOV_ORTHO);
+    this.perspCamera.fov = FOV_ORTHO;
+    this.perspCamera.position.copy(target).addScaledVector(dir, r);
+    this.perspCamera.up.copy(this.camera.up);
+    this.perspCamera.updateProjectionMatrix();
+    this.perspCamera.lookAt(target);
+    this.setActiveCamera(this.perspCamera);
+  }
+
+  /** Swap to a true orthographic camera matching the current perspective view. */
+  private swapToOrtho(): void {
+    const k = this.currentK();
+    const aspect = this.aspect();
+    this.orthoCamera.top = k;
+    this.orthoCamera.bottom = -k;
+    this.orthoCamera.left = -k * aspect;
+    this.orthoCamera.right = k * aspect;
+    this.orthoCamera.zoom = 1;
+    this.orthoCamera.updateProjectionMatrix();
+    this.setActiveCamera(this.orthoCamera);
+  }
+
+  /** Camera spherical orientation (theta, phi) for a head-on view of a face. */
+  private faceOrientation(face: GizmoFace): { theta: number; phi: number } {
+    const H = Math.PI / 2;
+    switch (face) {
+      case "front":
+        return { theta: 0, phi: H };
+      case "back":
+        return { theta: Math.PI, phi: H };
+      case "right":
+        return { theta: H, phi: H };
+      case "left":
+        return { theta: -H, phi: H };
+      // Top/bottom look down the Y axis; snap the azimuth to 0 so the view is
+      // consistently aligned (+Z toward the bottom of the screen) rather than
+      // keeping whatever rotation the camera happened to have.
+      case "top":
+        return { theta: 0, phi: 1e-3 };
+      case "bottom":
+        return { theta: 0, phi: Math.PI - 1e-3 };
+    }
+  }
+
+  private faceDir(face: GizmoFace): Vector3 {
+    switch (face) {
+      case "front":
+        return new Vector3(0, 0, 1);
+      case "back":
+        return new Vector3(0, 0, -1);
+      case "right":
+        return new Vector3(1, 0, 0);
+      case "left":
+        return new Vector3(-1, 0, 0);
+      case "top":
+        return new Vector3(0, 1, 0);
+      case "bottom":
+        return new Vector3(0, -1, 0);
+    }
+  }
+
+  /**
+   * Start a camera transition on the perspective camera. `goalTheta`/`goalPhi`
+   * may be null to keep the current orientation. The distance is derived from
+   * the FOV each frame to hold the perceived size constant. Orbit is never
+   * blocked - starting a drag cancels the animation (see onPointerDown).
+   */
+  private animateCamera(
+    goalTheta: number | null,
+    goalPhi: number | null,
+    goalFov: number,
+    onDone?: () => void,
+  ): void {
+    const target = this.controls.target.clone();
+    const sph = new Spherical().setFromVector3(
+      this.perspCamera.position.clone().sub(target),
+    );
+    const startFov = this.perspCamera.fov;
+    let dTheta = (goalTheta ?? sph.theta) - sph.theta;
+    dTheta = Math.atan2(Math.sin(dTheta), Math.cos(dTheta)); // shortest path
+
+    this.camAnim = {
+      elapsed: 0,
+      startTheta: sph.theta,
+      startPhi: sph.phi,
+      startFov,
+      dTheta,
+      goalPhi: goalPhi ?? sph.phi,
+      goalFov,
+      k: sph.radius * this.fovHalfTan(startFov),
+      target,
+      onDone,
+    };
+  }
+
+  private updateCamAnim(dt: number): void {
+    const a = this.camAnim;
+    if (!a) return;
+    a.elapsed += dt;
+    let t = a.elapsed / CAM_ANIM_DURATION;
+    if (t > 1) t = 1;
+    const e = 1 - Math.pow(1 - t, 3); // easeOutCubic - snappy
+
+    const theta = a.startTheta + a.dTheta * e;
+    let phi = a.startPhi + (a.goalPhi - a.startPhi) * e;
+    phi = Math.max(1e-3, Math.min(Math.PI - 1e-3, phi));
+    const fov = a.startFov + (a.goalFov - a.startFov) * e;
+    const radius = a.k / this.fovHalfTan(fov);
+
+    const sinP = Math.sin(phi);
+    this.perspCamera.position.set(
+      a.target.x + radius * sinP * Math.sin(theta),
+      a.target.y + radius * Math.cos(phi),
+      a.target.z + radius * sinP * Math.cos(theta),
+    );
+    this.perspCamera.fov = fov;
+    this.perspCamera.updateProjectionMatrix();
+    this.perspCamera.lookAt(a.target);
+
+    if (t >= 1) {
+      const done = a.onDone;
+      this.camAnim = null;
+      done?.();
+    }
+  }
+
+  /** Handle a click on a gizmo face: orient + lock to ortho, or toggle back. */
+  private onGizmoFace(face: GizmoFace): void {
+    const dir = this.camera.position
+      .clone()
+      .sub(this.controls.target)
+      .normalize();
+    const facingThis =
+      this.projection === "ortho" && dir.dot(this.faceDir(face)) > 0.999;
+
+    this.prepPerspForAnim();
+
+    if (facingThis) {
+      this.animateCamera(null, null, FOV_PERSP, () => {
+        this.projection = "persp";
+      });
+      return;
+    }
+
+    const o = this.faceOrientation(face);
+    this.animateCamera(o.theta, o.phi, FOV_ORTHO, () => this.swapToOrtho());
+    this.projection = "ortho";
+  }
+
+  /** Cancel an in-flight transition and settle into free perspective orbit. */
+  private cancelCamAnim(): void {
+    if (!this.camAnim) return;
+    this.camAnim = null;
+    const k = this.currentK();
+    const target = this.controls.target;
+    const dir = this.perspCamera.position.clone().sub(target).normalize();
+    this.perspCamera.fov = FOV_PERSP;
+    this.perspCamera.position
+      .copy(target)
+      .addScaledVector(dir, k / this.fovHalfTan(FOV_PERSP));
+    this.perspCamera.updateProjectionMatrix();
+    this.perspCamera.lookAt(target);
+    this.projection = "persp";
   }
 
   // ------------------------------------------------------------------ picking
@@ -374,12 +656,33 @@ export class VoxelEngine {
   // ------------------------------------------------------------------- events
 
   private onPointerDown = (e: PointerEvent): void => {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const gx = e.clientX - rect.left;
+    const gy = e.clientY - rect.top;
+
+    // Clicking the orientation gizmo orients/locks the camera (left button).
+    if (e.button === 0 && this.gizmo.containsPoint(gx, gy)) {
+      const face = this.gizmo.pick(gx, gy);
+      if (face) this.onGizmoFace(face);
+      return;
+    }
+    // Orbiting (right-drag) must never be blocked: cancel any in-flight camera
+    // transition so the drag takes over immediately in free perspective.
+    if (e.button === 2 && this.camAnim) {
+      this.cancelCamAnim();
+    }
+
     if (e.button !== 0) return;
     // While Space is held, left-drag is a camera pan handled by OrbitControls.
     if (this.spacePan) return;
     this.updatePointer(e);
 
     const store = useEditorStore.getState();
+    if (store.editorMode === "triview") {
+      this.triPointerDown(store);
+      return;
+    }
+
     const action: ToolAction = e.altKey ? "pick" : store.action;
 
     if (action === "pick") {
@@ -409,8 +712,31 @@ export class VoxelEngine {
   };
 
   private onPointerMove = (e: PointerEvent): void => {
-    this.updatePointer(e);
     const store = useEditorStore.getState();
+
+    // Hovering the orientation gizmo: highlight the face and skip voxel hover.
+    if (!this.isPainting && !this.triPainting) {
+      const rect = this.renderer.domElement.getBoundingClientRect();
+      const gx = e.clientX - rect.left;
+      const gy = e.clientY - rect.top;
+      if (this.gizmo.containsPoint(gx, gy)) {
+        this.gizmo.setHover(this.gizmo.pick(gx, gy));
+        this.hover.visible = false;
+        if (!this.spacePan) this.renderer.domElement.style.cursor = "pointer";
+        return;
+      }
+      this.gizmo.setHover(null);
+      if (!this.spacePan && this.renderer.domElement.style.cursor === "pointer") {
+        this.renderer.domElement.style.cursor = "";
+      }
+    }
+
+    this.updatePointer(e);
+    if (store.editorMode === "triview") {
+      this.hover.visible = false;
+      this.triPointerMove(store);
+      return;
+    }
     const action: ToolAction = e.altKey ? "pick" : store.action;
     const target = this.targetCell(action === "pick" ? "erase" : action);
 
@@ -447,12 +773,17 @@ export class VoxelEngine {
   };
 
   private onPointerUp = (e: PointerEvent): void => {
+    const store = useEditorStore.getState();
+    if (store.editorMode === "triview") {
+      this.updatePointer(e);
+      this.triPointerUp(store);
+      return;
+    }
     if (!this.isPainting) {
       this.discardSnapshotIfNoop();
       return;
     }
     this.updatePointer(e);
-    const store = useEditorStore.getState();
     const action: ToolAction = store.action;
 
     if ((store.brush === "box" || store.brush === "line") && this.dragStart) {
@@ -675,62 +1006,324 @@ export class VoxelEngine {
 
   private pendingSnapshot: VoxelData | null = null;
 
+  /** Capture the current volume + masks as one history entry. */
+  private currentEntry(): HistoryEntry {
+    return { volume: this.data.clone(), masks: this.triMasks.snapshot() };
+  }
+
+  private pushHistory(volume: VoxelData): void {
+    this.undoStack.push({ volume, masks: this.triMasks.snapshot() });
+    if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
+    this.redoStack = [];
+  }
+
   private discardSnapshotIfNoop(): void {
     if (!this.pendingSnapshot) return;
     if (this.paintedThisStroke.size > 0) {
-      this.undoStack.push(this.pendingSnapshot);
-      if (this.undoStack.length > MAX_HISTORY) this.undoStack.shift();
-      this.redoStack = [];
+      this.pushHistory(this.pendingSnapshot);
     }
     this.pendingSnapshot = null;
     this.syncStats();
   }
 
-  undo(): void {
-    const snap = this.undoStack.pop();
-    if (!snap) return;
-    this.redoStack.push(this.data.clone());
-    this.data = snap;
+  private restoreEntry(entry: HistoryEntry): void {
+    this.data = entry.volume;
+    this.triMasks.restore(entry.masks);
+    if (useEditorStore.getState().editorMode === "triview") this.redrawPlanes();
     this.commitEdit();
   }
 
+  undo(): void {
+    const entry = this.undoStack.pop();
+    if (!entry) return;
+    this.redoStack.push(this.currentEntry());
+    this.restoreEntry(entry);
+  }
+
   redo(): void {
-    const snap = this.redoStack.pop();
-    if (!snap) return;
-    this.undoStack.push(this.data.clone());
-    this.data = snap;
-    this.commitEdit();
+    const entry = this.redoStack.pop();
+    if (!entry) return;
+    this.undoStack.push(this.currentEntry());
+    this.restoreEntry(entry);
   }
 
   // -------------------------------------------------------- volume operations
 
   clearVolume(): void {
-    this.snapshot();
+    this.pushHistory(this.data.clone());
     this.data.clear();
-    this.undoStack.push(this.pendingSnapshot!);
-    this.pendingSnapshot = null;
     this.commitEdit();
   }
 
   fillVolume(): void {
-    this.snapshot();
+    this.pushHistory(this.data.clone());
     const color = useEditorStore.getState().currentColor;
     const { x: dx, y: dy, z: dz } = this.data.dims;
     for (let x = 0; x < dx; x++)
       for (let y = 0; y < dy; y++)
         for (let z = 0; z < dz; z++) this.data.set(x, y, z, color);
-    this.undoStack.push(this.pendingSnapshot!);
-    this.pendingSnapshot = null;
     this.commitEdit();
   }
 
   loadStarterShape(shape: StarterShapeId): void {
-    this.snapshot();
+    this.pushHistory(this.data.clone());
     fillStarterShape(this.data, shape);
-    this.undoStack.push(this.pendingSnapshot!);
-    this.pendingSnapshot = null;
-    this.redoStack = [];
     this.commitEdit();
+  }
+
+  /**
+   * Replace the whole document with an imported model (e.g. a parsed `.vox`).
+   * The volume may have different dimensions, so the grid, ground plane and
+   * tri-view planes are rebuilt to match and the camera reframes onto it.
+   *
+   * Importing is treated as opening a new file: existing undo/redo history is
+   * cleared because past snapshots are sized to the previous volume.
+   */
+  loadVoxModel(data: VoxelData, palette: Palette): void {
+    this.undoStack = [];
+    this.redoStack = [];
+
+    const dimsChanged =
+      data.dims.x !== this.data.dims.x ||
+      data.dims.y !== this.data.dims.y ||
+      data.dims.z !== this.data.dims.z;
+
+    this.data = data;
+    if (dimsChanged) this.rebuildForDims(data.dims);
+
+    // Adopt the file's palette (a new array reference triggers a mesh rebuild
+    // and plane-fill refresh via the store subscription).
+    useEditorStore.getState().setPalette(palette);
+
+    if (useEditorStore.getState().editorMode === "triview") {
+      this.triMasks.projectFromVolume(this.data);
+      this.regenerateFromMasks();
+      this.redrawPlanes();
+    }
+
+    this.frameVolume();
+    this.commitEdit();
+  }
+
+  /** Recreate dimension-dependent scene helpers for a new volume size. */
+  private rebuildForDims(dims: VoxelDims): void {
+    const span = Math.max(dims.x, dims.z);
+
+    this.scene.remove(this.grid);
+    this.grid.geometry.dispose();
+    (this.grid.material as LineBasicMaterial).dispose();
+    this.grid = new GridHelper(span, span, 0x556070, 0x33404d);
+    this.grid.position.set(dims.x / 2, 0, dims.z / 2);
+    this.grid.visible = useEditorStore.getState().showGrid;
+    this.scene.add(this.grid);
+
+    this.scene.remove(this.groundPlane);
+    this.groundPlane.geometry.dispose();
+    (this.groundPlane.material as MeshBasicMaterial).dispose();
+    this.groundPlane = new Mesh(
+      new PlaneGeometry(span, span),
+      new MeshBasicMaterial({ visible: false }),
+    );
+    this.groundPlane.rotation.x = -Math.PI / 2;
+    this.groundPlane.position.set(dims.x / 2, 0, dims.z / 2);
+    this.scene.add(this.groundPlane);
+
+    this.scene.remove(this.triPlanes.group);
+    this.triPlanes.dispose();
+    this.triMasks = new TriViewMasks(dims);
+    this.triPlanes = new TriViewPlanes(dims, this.triMasks);
+    this.triPlanes.setVisible(useEditorStore.getState().editorMode === "triview");
+    this.scene.add(this.triPlanes.group);
+  }
+
+  /** Point the camera, controls target and key light at the current volume. */
+  private frameVolume(): void {
+    const c = this.center();
+    const span = Math.max(this.data.dims.x, this.data.dims.y, this.data.dims.z);
+    this.controls.target.copy(c);
+    this.camera.position.set(c.x + span * 1.25, c.y + span * 1.2, c.z + span * 1.6);
+    this.dirLight.position.set(c.x + span, c.y + span * 1.6, c.z + span * 0.6);
+    this.controls.update();
+  }
+
+  // ---------------------------------------------------------- tri-view modeling
+
+  /** Push the current volume + masks onto the undo stack (groups one stroke). */
+  private pushUndoSnapshot(): void {
+    this.pushHistory(this.data.clone());
+    this.syncStats();
+  }
+
+  /** Rebuild the volume as the intersection of the three silhouette masks. */
+  private regenerateFromMasks(): void {
+    this.triMasks.applyToVolume(this.data);
+    this.commitEdit();
+  }
+
+  private redrawPlanes(preview?: PreviewSpec, hover?: PlaneHit | null): void {
+    this.triPlanes.redraw(useEditorStore.getState().palette, preview, hover ?? undefined);
+  }
+
+  private enterTriView(): void {
+    // Project the volume onto the three planes, then rebuild it as their
+    // intersection. The directional color projection is stable, so a no-edit
+    // tri-view <-> sculpt round-trip reproduces the same volume.
+    this.triMasks.projectFromVolume(this.data);
+    this.pushUndoSnapshot();
+    this.regenerateFromMasks();
+    this.triPlanes.setVisible(true);
+    this.redrawPlanes();
+    this.hover.visible = false;
+  }
+
+  private exitTriView(): void {
+    this.triPlanes.setVisible(false);
+    this.triPainting = false;
+    this.triDragStart = null;
+  }
+
+  clearMasks(): void {
+    this.pushUndoSnapshot();
+    this.triMasks.clearAll();
+    this.regenerateFromMasks();
+    this.redrawPlanes();
+  }
+
+  reseedMasks(): void {
+    this.pushUndoSnapshot();
+    this.triMasks.projectFromVolume(this.data);
+    this.regenerateFromMasks();
+    this.redrawPlanes();
+  }
+
+  private triPlaneCols(id: PlaneId): number {
+    return this.triPlanes.cols(id);
+  }
+  private triPlaneRows(id: PlaneId): number {
+    return this.triPlanes.rows(id);
+  }
+
+  private applyPlaneCells(
+    id: PlaneId,
+    cells: Array<[number, number]>,
+    value: number,
+  ): void {
+    const cols = this.triPlaneCols(id);
+    const rows = this.triPlaneRows(id);
+    for (const [a, b] of cells) {
+      if (a >= 0 && b >= 0 && a < cols && b < rows) {
+        this.triPlanes.set(id, a, b, value);
+      }
+    }
+  }
+
+  /** Filled disc footprint in plane (a, b) space (diameter = brush size). */
+  private disc2D(a: number, b: number, size: number): Array<[number, number]> {
+    if (size <= 1) return [[a, b]];
+    const radius = size / 2;
+    const r = Math.ceil(radius - 1e-6);
+    const cells: Array<[number, number]> = [];
+    for (let da = -r; da <= r; da++)
+      for (let db = -r; db <= r; db++) {
+        if (da * da + db * db <= radius * radius) cells.push([a + da, b + db]);
+      }
+    return cells;
+  }
+
+  private box2D(s: PlaneHit, e: PlaneHit): Array<[number, number]> {
+    const cells: Array<[number, number]> = [];
+    const [a0, a1] = [Math.min(s.a, e.a), Math.max(s.a, e.a)];
+    const [b0, b1] = [Math.min(s.b, e.b), Math.max(s.b, e.b)];
+    for (let a = a0; a <= a1; a++)
+      for (let b = b0; b <= b1; b++) cells.push([a, b]);
+    return cells;
+  }
+
+  private line2D(s: PlaneHit, e: PlaneHit): Array<[number, number]> {
+    const cells: Array<[number, number]> = [];
+    const da = e.a - s.a;
+    const db = e.b - s.b;
+    const steps = Math.max(Math.abs(da), Math.abs(db), 1);
+    for (let i = 0; i <= steps; i++) {
+      const t = i / steps;
+      cells.push([Math.round(s.a + da * t), Math.round(s.b + db * t)]);
+    }
+    return cells;
+  }
+
+  private triStamp(store: ReturnType<typeof useEditorStore.getState>, hit: PlaneHit): void {
+    const cells =
+      store.brush === "voxel" ? this.disc2D(hit.a, hit.b, store.brushSize) : [
+        [hit.a, hit.b] as [number, number],
+      ];
+    this.applyPlaneCells(hit.id, cells, this.triValue);
+    this.regenerateFromMasks();
+    this.redrawPlanes(undefined, hit);
+  }
+
+  private triPointerDown(store: ReturnType<typeof useEditorStore.getState>): void {
+    const hit = this.triPlanes.pick(this.raycaster);
+    if (!hit) return;
+    // Reuse the left-side tools: Attach/Paint add silhouette, Erase removes it,
+    // Pick is a no-op on the planes.
+    if (store.action === "pick") return;
+    this.triValue = store.action === "erase" ? 0 : store.currentColor;
+    this.triPainting = true;
+    this.pushUndoSnapshot();
+
+    if (store.brush === "box" || store.brush === "line") {
+      this.triDragStart = hit;
+      this.redrawPlanes({ id: hit.id, cells: [[hit.a, hit.b]], value: this.triValue }, hit);
+    } else {
+      this.triStamp(store, hit);
+    }
+  }
+
+  private triPointerMove(store: ReturnType<typeof useEditorStore.getState>): void {
+    const hit = this.triPlanes.pick(this.raycaster);
+
+    if (
+      this.triPainting &&
+      this.triDragStart &&
+      (store.brush === "box" || store.brush === "line")
+    ) {
+      if (hit && hit.id === this.triDragStart.id) {
+        const cells =
+          store.brush === "box"
+            ? this.box2D(this.triDragStart, hit)
+            : this.line2D(this.triDragStart, hit);
+        this.redrawPlanes({ id: hit.id, cells, value: this.triValue }, hit);
+      }
+      return;
+    }
+
+    if (this.triPainting && hit) {
+      this.triStamp(store, hit);
+      return;
+    }
+
+    // Not painting: hover outline.
+    this.redrawPlanes(undefined, hit);
+  }
+
+  private triPointerUp(store: ReturnType<typeof useEditorStore.getState>): void {
+    if (
+      this.triPainting &&
+      this.triDragStart &&
+      (store.brush === "box" || store.brush === "line")
+    ) {
+      const hit = this.triPlanes.pick(this.raycaster);
+      const end = hit && hit.id === this.triDragStart.id ? hit : this.triDragStart;
+      const cells =
+        store.brush === "box"
+          ? this.box2D(this.triDragStart, end)
+          : this.line2D(this.triDragStart, end);
+      this.applyPlaneCells(this.triDragStart.id, cells, this.triValue);
+      this.regenerateFromMasks();
+    }
+    this.triPainting = false;
+    this.triDragStart = null;
+    this.redrawPlanes();
   }
 
   // -------------------------------------------------------------------- store
@@ -751,6 +1344,18 @@ export class VoxelEngine {
 
     if (state.showGrid !== prev.showGrid) {
       this.grid.visible = state.showGrid;
+    }
+
+    if (state.editorMode !== prev.editorMode) {
+      if (state.editorMode === "triview") this.enterTriView();
+      else this.exitTriView();
+    }
+
+    // The selected color is the brush color (applied per stroke), so it should
+    // not recolor existing geometry. Only redraw plane fills if the palette's
+    // hex values themselves changed (the mesh rebuild is already queued above).
+    if (state.editorMode === "triview" && state.palette !== prev.palette) {
+      this.redrawPlanes();
     }
   }
 
@@ -789,6 +1394,8 @@ export class VoxelEngine {
     (this.previewBoxEdges.material as LineBasicMaterial).dispose();
     this.previewCells.geometry.dispose();
     (this.previewCells.material as MeshBasicMaterial).dispose();
+    this.triPlanes.dispose();
+    this.gizmo.dispose();
     this.renderer.dispose();
     if (el.parentElement === this.container) this.container.removeChild(el);
   }

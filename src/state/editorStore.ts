@@ -11,7 +11,13 @@ export type BrushShape = "voxel" | "box" | "line" | "face";
 
 export type MirrorAxis = "x" | "y" | "z";
 
+/** Top-level authoring mode. */
+export type EditorMode = "sculpt" | "triview";
+
 export interface EditorState {
+  // Mode
+  editorMode: EditorMode;
+
   // Tools
   action: ToolAction;
   brush: BrushShape;
@@ -45,11 +51,13 @@ export interface EditorState {
   canRedo: boolean;
 
   // Actions
+  setEditorMode: (mode: EditorMode) => void;
   setAction: (action: ToolAction) => void;
   setBrush: (brush: BrushShape) => void;
   setBrushSize: (size: number) => void;
   setCurrentColor: (index: number) => void;
   setPaletteColor: (index: number, hex: string) => void;
+  setPalette: (palette: Palette) => void;
   toggleMirror: (axis: MirrorAxis) => void;
   setField: (field: NormalField) => void;
   setShading: (shading: ShadingMode) => void;
@@ -69,6 +77,7 @@ export interface EditorState {
 }
 
 export const useEditorStore = create<EditorState>((set) => ({
+  editorMode: "sculpt",
   action: "attach",
   brush: "voxel",
   brushSize: 1,
@@ -94,6 +103,7 @@ export const useEditorStore = create<EditorState>((set) => ({
   canUndo: false,
   canRedo: false,
 
+  setEditorMode: (editorMode) => set({ editorMode }),
   setAction: (action) => set({ action }),
   setBrush: (brush) => set({ brush }),
   setBrushSize: (brushSize) =>
@@ -105,6 +115,7 @@ export const useEditorStore = create<EditorState>((set) => ({
       palette[index] = hex;
       return { palette };
     }),
+  setPalette: (palette) => set({ palette: palette.slice() }),
   toggleMirror: (axis) =>
     set((s) => ({ mirror: { ...s.mirror, [axis]: !s.mirror[axis] } })),
   setField: (field) => set({ field }),
