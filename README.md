@@ -128,6 +128,27 @@ This is a research prototype. The whitepaper outlines several open directions - 
 alternative weighting functions, GPU normal generation, and DSS combined with palette-quantized
 lighting - that remain to be explored.
 
+## License
+
+The **DSS method library** is released under the [MIT License](src/voxel/LICENSE). This covers the
+core algorithm and data files in [`src/voxel/`](src/voxel/):
+
+- [`dss.ts`](src/voxel/dss.ts) - gradient & centroid normal fields, kernel weighting, normal cache,
+  and vertex-interpolated normals
+- [`ao.ts`](src/voxel/ao.ts) - occupancy-derived ambient occlusion
+- [`meshBuilder.ts`](src/voxel/meshBuilder.ts) - cube mesh construction with derived normals/AO applied
+- [`VoxelData.ts`](src/voxel/VoxelData.ts) - sparse voxel volume / occupancy field
+- [`palette.ts`](src/voxel/palette.ts) - color palette model used by the above
+
+Each of these files carries an `SPDX-License-Identifier: MIT` header.
+
+**The editor application is intentionally excluded.** Everything else in the repository - the React
+UI ([`src/components/`](src/components/), [`src/state/`](src/state/)), the Three.js engine
+([`src/engine/`](src/engine/)), the editor-support helpers in `src/voxel/` (`voxParser.ts`,
+`starterShapes.ts`, `TriViewMasks.ts`), the figure harness, and the whitepaper - is **not** covered
+by the MIT license unless a file carries its own MIT SPDX header. The method library is self-contained
+(it has no dependencies back into the editor), so it can be reused independently of this app.
+
 ## Credits
 
 The example voxel models in [`src/examples/`](src/examples/) - used for several whitepaper figures

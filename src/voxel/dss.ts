@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Dan Fessler
+// Part of the Derived Surface Shading (DSS) method library. See ./LICENSE.
+
 import { Vector3 } from "three";
 import type { VoxelData } from "./VoxelData";
 
